@@ -239,6 +239,10 @@ def main(
     database = sfm_dir / "database.db"
     reference = pycolmap.Reconstruction(reference_model)
 
+    if sfm_dir.exists():
+        logger.warning("The SfM directory already exists, directly using it.")
+        return pycolmap.Reconstruction(sfm_dir)
+
     image_ids = create_db_from_model(reference, database)
     import_features(image_ids, database, features)
     import_matches(
