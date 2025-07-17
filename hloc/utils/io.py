@@ -37,9 +37,12 @@ def get_keypoints(
     path: Path, name: str, return_uncertainty: bool = False
 ) -> np.ndarray:
     with h5py.File(str(path), "r", libver="latest") as hfile:
-        dset = hfile[name]["keypoints"]
-        p = dset.__array__()
-        uncertainty = dset.attrs.get("uncertainty")
+        if name in hfile:
+            dset = hfile[name]["keypoints"]
+            p = dset.__array__()
+            uncertainty = dset.attrs.get("uncertainty")
+        else:
+            p, uncertainty = None, None
     if return_uncertainty:
         return p, uncertainty
     return p

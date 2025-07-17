@@ -69,6 +69,9 @@ def import_features(
 
     for image_name, image_id in tqdm(image_ids.items()):
         keypoints = get_keypoints(features_path, image_name)
+        if keypoints is None:
+            logger.warning("No keypoints for %s", image_name)
+            continue
         keypoints += 0.5  # COLMAP origin
         db.add_keypoints(image_id, keypoints)
 

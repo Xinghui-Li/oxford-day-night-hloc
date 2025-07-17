@@ -2,6 +2,7 @@ import argparse
 import pickle
 from collections import defaultdict
 from pathlib import Path
+from pycolmap import Rigid3d
 from typing import Dict, List, Union
 
 import numpy as np
@@ -58,13 +59,27 @@ class QueryLocalizer:
     def localize(self, points2D_all, points2D_idxs, points3D_id, query_camera):
         points2D = points2D_all[points2D_idxs]
         points3D = [self.reconstruction.points3D[j].xyz for j in points3D_id]
-        ret = pycolmap.absolute_pose_estimation(
-            points2D,
-            points3D,
-            query_camera,
-            estimation_options=self.config.get("estimation", {}),
-            refinement_options=self.config.get("refinement", {}),
-        )
+        if points2D.shape[0] < 3 or len(points3D) < 3:
+            logger.debug(
+                f"Not enough points for localization: {points2D.shape[0]} 2D points, {len(points3D)} 3D points."
+            )
+            qvec = np.array([1.0, 0.0, 0.0, 0.0])  # identity rotation
+            tvec = np.array([0.0, 0.0, 0.0])       # zero translation
+            pose = Rigid3d(qvec, tvec)
+            inlier_mask = np.zeros((3,), dtype=bool)
+            ret = {
+                "cam_from_world": pose,
+                "num_inliers": 0,
+                "inlier_mask": inlier_mask,
+                }
+        else:
+            ret = pycolmap.estimate_and_refine_absolute_pose(
+                points2D,
+                points3D,
+                query_camera,
+                estimation_options=self.config.get("estimation", {}),
+                refinement_options=self.config.get("refinement", {}),
+            )
         return ret
 
 
