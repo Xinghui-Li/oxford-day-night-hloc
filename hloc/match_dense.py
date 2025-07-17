@@ -6,12 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
+import cv2
 import h5py
 import numpy as np
 import torch
 import torchvision.transforms.functional as F
 from scipy.spatial import KDTree
 from tqdm import tqdm
+from PIL import Image
 
 from . import logger, matchers
 from .extract_features import read_image, resize_image
@@ -19,6 +21,8 @@ from .match_features import find_unique_new_pairs
 from .utils.base_model import dynamic_load
 from .utils.io import list_h5_names
 from .utils.parsers import names_to_pair, parse_retrieval
+from romatch import roma_outdoor, tiny_roma_v1_outdoor, roma_indoor
+from torch.utils.data._utils.collate import default_collate
 
 # Default usage:
 # dense_conf = confs['loftr']
@@ -59,6 +63,20 @@ confs = {
         "preprocessing": {"grayscale": True, "resize_max": 1024, "dfactor": 8},
         "max_error": 4,  # max error for assigned keypoints (in px)
         "cell_size": 4,  # size of quantization patch (max 1 kp/patch)
+    },
+    "roma_outdoor": {
+        "output": "matches-roma_outdoor",
+        "model": {"name": "roma_outdoor", "coarse_res": 560, "upsample_res": 864},
+        "preprocessing": {"roma_preprocess": True, "grayscale": False},
+        "max_error": 2,
+        "cell_size": 8,
+    },
+    "roma_indoor": {
+        "output": "matches-roma_indoor",
+        "model": {"name": "roma_indoor", "coarse_res": 560, "upsample_res": 864},
+        "preprocessing": {"roma_preprocess": True, "grayscale": False},
+        "max_error": 2,
+        "cell_size": 8,
     },
 }
 
@@ -161,12 +179,35 @@ def scale_keypoints(kpts, scale):
     return kpts
 
 
+def collate_with_pil(batch):
+    elem = batch[0]
+
+    if isinstance(elem, Image.Image):
+        # If the dataset returns a bare PIL image (not a dict/tuple)
+        return list(batch)
+
+    if isinstance(elem, dict):
+        return {
+            key: list(val) if isinstance(val[0], Image.Image)
+            else default_collate(val)
+            for key, val in zip(elem.keys(), zip(*batch))
+        }
+
+    if isinstance(elem, (tuple, list)):
+        return [
+            list(samples) if isinstance(samples[0], Image.Image)
+            else default_collate(samples)
+            for samples in zip(*batch)
+        ]
+
+
 class ImagePairDataset(torch.utils.data.Dataset):
     default_conf = {
         "grayscale": True,
         "resize_max": 1024,
         "dfactor": 8,
         "cache_images": False,
+        "roma_preprocess": False,
     }
 
     def __init__(self, image_dir, conf, pairs):
@@ -180,6 +221,10 @@ class ImagePairDataset(torch.utils.data.Dataset):
             self.scales = {}
             for name in tqdm(image_names):
                 image = read_image(self.image_dir / name, self.conf.grayscale)
+                
+                #### -- for ARIA only: rotate the image 90 degree clockwise -- ###
+                image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+
                 self.images[name], self.scales[name] = self.preprocess(image)
 
     def preprocess(self, image: np.ndarray):
@@ -223,8 +268,20 @@ class ImagePairDataset(torch.utils.data.Dataset):
         else:
             image0 = read_image(self.image_dir / name0, self.conf.grayscale)
             image1 = read_image(self.image_dir / name1, self.conf.grayscale)
-            image0, scale0 = self.preprocess(image0)
-            image1, scale1 = self.preprocess(image1)
+            
+            #### -- for ARIA only: rotate the image 90 degree clockwise -- ###
+            image0 = cv2.rotate(image0, cv2.ROTATE_90_CLOCKWISE)
+            image1 = cv2.rotate(image1, cv2.ROTATE_90_CLOCKWISE)
+
+            if self.conf.roma_preprocess:
+                image0 = Image.fromarray(image0)
+                image1 = Image.fromarray(image1)
+                scale0 = np.array([1.0, 1.0])
+                scale1 = np.array([1.0, 1.0])
+            else:
+                image0, scale0 = self.preprocess(image0)
+                image1, scale1 = self.preprocess(image1)
+                
         return image0, image1, scale0, scale1, name0, name1
 
 
@@ -237,12 +294,20 @@ def match_dense(
     existing_refs: Optional[List] = [],
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    Model = dynamic_load(matchers, conf["model"]["name"])
-    model = Model(conf["model"]).eval().to(device)
+    if "roma" in conf["model"]["name"]:
+        coarse_res = conf["model"]["coarse_res"]
+        upsample_res = conf["model"]["upsample_res"]
+        if conf["model"]["name"] == "roma_outdoor":
+            model = roma_outdoor("cuda", coarse_res=coarse_res, upsample_res=upsample_res)
+        else:
+            model = roma_indoor("cuda", coarse_res=coarse_res, upsample_res=upsample_res)
+    else:
+        Model = dynamic_load(matchers, conf["model"]["name"])
+        model = Model(conf["model"]).eval().to(device)
 
     dataset = ImagePairDataset(image_dir, conf["preprocessing"], pairs)
     loader = torch.utils.data.DataLoader(
-        dataset, num_workers=16, batch_size=1, shuffle=False
+        dataset, num_workers=16, batch_size=1, shuffle=False, collate_fn=collate_with_pil
     )
 
     logger.info("Performing dense matching...")
@@ -251,24 +316,50 @@ def match_dense(
             # load image-pair data
             image0, image1, scale0, scale1, (name0,), (name1,) = data
             scale0, scale1 = scale0[0].numpy(), scale1[0].numpy()
-            image0, image1 = image0.to(device), image1.to(device)
 
-            # match semi-dense
-            # for consistency with pairs_from_*: refine kpts of image0
-            if name0 in existing_refs:
-                # special case: flip to enable refinement in query image
-                pred = model({"image0": image1, "image1": image0})
+            if "roma" in conf["model"]["name"]:
+                image0 = image0[0]
+                image1 = image1[0]
+                w0, h0 = image0.size
+                w1, h1 = image1.size
+                warp, scores = model.match(image0, image1)
+                matches, scores = model.sample(warp, scores, num=8192)
+                kpts0, kpts1 = model.to_pixel_coordinates(matches, h0, w0, h1, w1)
                 pred = {
-                    **pred,
-                    "keypoints0": pred["keypoints1"],
-                    "keypoints1": pred["keypoints0"],
+                    "keypoints0": kpts0,
+                    "keypoints1": kpts1,
+                    "scores": scores,
                 }
-            else:
-                # usual case
-                pred = model({"image0": image0, "image1": image1})
+            else:    
+                # match semi-dense
+                # for consistency with pairs_from_*: refine kpts of image0
+                image0, image1 = image0.to(device), image1.to(device)
+                if name0 in existing_refs:
+                    # special case: flip to enable refinement in query image
+                    pred = model({"image0": image1, "image1": image0})
+                    pred = {
+                        **pred,
+                        "keypoints0": pred["keypoints1"],
+                        "keypoints1": pred["keypoints0"],
+                    }
+                else:
+                    # usual case
+                    pred = model({"image0": image0, "image1": image1})
 
             # Rescale keypoints and move to cpu
             kpts0, kpts1 = pred["keypoints0"], pred["keypoints1"]
+
+            #### -- for ARIA only: rotate keypoint 90 degree anticlockwise  -- ###
+            if "roma" in conf["model"]["name"]:
+                w0, h0 = image0.size
+                w1, h1 = image1.size
+            else:
+                h0, w0 = image0.shape[-2:]
+                h1, w1 = image1.shape[-2:]
+            kpts0[:, 0], kpts0[:, 1] = kpts0[:, 1], w0 - kpts0[:, 0] - 1
+            kpts1[:, 0], kpts1[:, 1] = kpts1[:, 1], w1 - kpts1[:, 0] - 1
+            scale0, scale1 = scale1, scale0
+
             kpts0 = scale_keypoints(kpts0 + 0.5, scale0) - 0.5
             kpts1 = scale_keypoints(kpts1 + 0.5, scale1) - 0.5
             kpts0 = kpts0.cpu().numpy()

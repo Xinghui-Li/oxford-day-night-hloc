@@ -1,14 +1,18 @@
 import argparse
 from pathlib import Path
 
+import json
 import numpy as np
 import scipy.spatial
 
 from . import logger
+from scipy.spatial.transform import Rotation as R
+from aria_constant import ARIA_DATASET_ROOT
 from .pairs_from_retrieval import pairs_from_score_matrix
 from .utils.read_write_model import read_images_binary
 
 DEFAULT_ROT_THRESH = 30  # in degrees
+ARIA_ROT_THRESH = 50
 
 
 def get_pairwise_distances(images):
@@ -52,6 +56,88 @@ def main(model, output, num_matched, rotation_threshold=DEFAULT_ROT_THRESH):
     np.fill_diagonal(invalid, True)
     pairs = pairs_from_score_matrix(scores, invalid, num_matched)
     pairs = [(images[ids[i]].name, images[ids[j]].name) for i, j in pairs]
+
+    logger.info(f"Found {len(pairs)} pairs.")
+    with open(output, "w") as f:
+        f.write("\n".join(" ".join(p) for p in pairs))
+
+
+def get_dist_to_db(query_image_info, db_c2w):
+
+    dists = []
+    oris = []
+
+    for info in query_image_info:
+        c2w = np.linalg.inv(np.array(info["transform_matrix"]))
+        translation = c2w[:3, 3][np.newaxis, :]
+        orientation = c2w[:3, :3][np.newaxis, :, :]
+        
+        db_trans = db_c2w[:, :3, 3]
+        t_errs = np.linalg.norm(db_trans - translation, axis=1)
+
+        db_ori = db_c2w[:, :3, :3]
+        inv_orientation = np.linalg.inv(orientation[0])[np.newaxis, :, :]
+        r_errs = db_ori @ inv_orientation
+        r_errs = R.from_matrix(r_errs).as_rotvec()
+        r_errs = np.linalg.norm(r_errs, axis=1) * 180 / np.pi
+
+        dists.append(t_errs)
+        oris.append(r_errs)
+
+    return dists, oris 
+
+
+def aria_pose_main(
+    output,
+    scene,
+    num_matched,
+    query_list,
+    db_list,
+):
+    if output.exists():
+        logger.info(f"Output file {output} already exists. Skipping...")
+        return
+
+    # load the image list
+    image_root = [p for p in (ARIA_DATASET_ROOT / scene / "ns_processed" / "multi" / "undistorted_all_valid").glob("day_night_*") \
+                    if p.is_dir()][0]
+    all_image_info = json.load(open(str(image_root / "transforms_opencv.json"), "r"))["frames"]
+    path2info = {}
+    for info in all_image_info:
+        path2info[info["file_path"]] = info
+
+    db_image_info = []
+    db_c2w = []
+    with open(str(db_list), "r") as f:
+        db_lines = f.readlines()
+        for line in db_lines:
+            line = line.strip().split(" ")
+            if len(line) == 0:
+                continue
+            transform = np.array(path2info[line[0]]["transform_matrix"])
+            db_c2w.append(np.linalg.inv(transform))
+            db_image_info.append(path2info[line[0]])
+
+    db_c2w = np.stack(db_c2w, axis=0)
+
+    query_image_info = []
+    with open(str(query_list), "r") as f:
+        lines = f.readlines()
+        for line in lines:
+            line = line.strip().split(" ")
+            if len(line) == 0:
+                continue
+            query_image_info.append(path2info[line[0]])
+
+    dists, oris = get_dist_to_db(query_image_info, db_c2w)
+
+    pairs = []
+    for i, (dist, ori) in enumerate(zip(dists, oris)):
+        dist_closest_indices = np.argsort(dist)[:num_matched]
+        ori_closest = ori[dist_closest_indices]
+        selected_indices = dist_closest_indices
+        for j in selected_indices:
+            pairs.append([query_image_info[i]["file_path"], db_image_info[j]["file_path"]])
 
     logger.info(f"Found {len(pairs)} pairs.")
     with open(output, "w") as f:

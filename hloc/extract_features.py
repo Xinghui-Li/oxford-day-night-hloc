@@ -166,6 +166,31 @@ def resize_image(image, size, interp):
     return resized
 
 
+def rotate_batch_90_anticlockwise(data: Dict[str, torch.Tensor], pred: Dict[str, np.ndarray]=None):
+    """
+    Rotate the batch of images and keypoints by 90 degrees anticlockwise.
+    Args:
+        data: Dictionary containing the image and original size.
+        pred: Dictionary containing the keypoints.
+    Returns:
+        data: Updated data dictionary with rotated image and original size.
+        pred: Updated pred dictionary with rotated keypoints.
+    """
+
+    H, W = data["image"].shape[2:]
+
+    # Rotate images
+    data["image"] = torch.rot90(data["image"], k=1, dims=(2, 3))  # Rotate 90 degrees anti-clockwise
+    data["original_size"] = data["original_size"][:, [1, 0]]  # Swap width and height
+
+    if pred is None:
+        return data
+    else:
+        # Rotate keypoints
+        pred["keypoints"][:, 0], pred["keypoints"][:, 1] = pred["keypoints"][:, 1], W - pred["keypoints"][:, 0] - 1
+        return data, pred
+
+
 class ImageDataset(torch.utils.data.Dataset):
     default_conf = {
         "globs": ["*.jpg", "*.png", "*.jpeg", "*.JPG", "*.PNG"],
@@ -203,6 +228,10 @@ class ImageDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         name = self.names[idx]
         image = read_image(self.root / name, self.conf.grayscale)
+
+        #### -- for ARIA data only: rotate the image 90 degree clockwise -- ###
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+
         image = image.astype(np.float32)
         size = image.shape[:2][::-1]
 
@@ -266,6 +295,12 @@ def main(
         name = dataset.names[idx]
         pred = model({"image": data["image"].to(device, non_blocking=True)})
         pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+
+        #### -- for ARIA data only: rotate image and keypoint 90 degree anticlockwise after prediction-- ###
+        if "global" in conf["output"]:
+            data = rotate_batch_90_anticlockwise(data)
+        else:
+            data, pred = rotate_batch_90_anticlockwise(data, pred)
 
         pred["image_size"] = original_size = data["original_size"][0].numpy()
         if "keypoints" in pred:
